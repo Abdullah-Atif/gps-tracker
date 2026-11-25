@@ -628,23 +628,31 @@ function applyLanguage() {
 const map = L.map('map', { zoomControl: true, attributionControl: true }).setView(DEFAULT_VIEW, 12);
 map.zoomControl.setPosition('bottomright');
 const LAYERS = {
-  // CARTO "Voyager" street map (OpenStreetMap data). Unlike tile.openstreetmap.org it also
-  // works when the page is opened as a local file (OSM blocks requests without a Referer).
-  street: () => [L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-    maxZoom: 20, subdomains: 'abcd', attribution: '&copy; OpenStreetMap contributors &copy; CARTO' })],
+  // Street map. On a web server (GitHub Pages) the OpenStreetMap tiles are used. OSM blocks
+  // requests without a Referer, so a page opened as a local file uses the Esri street map instead.
+  street: () => [location.protocol === 'file:'
+    ? L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 20, maxNativeZoom: 19, attribution: 'Map &copy; Esri, HERE, Garmin, OpenStreetMap contributors' })
+    : L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 20, maxNativeZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' })],
   satellite: () => [
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
       maxZoom: 19, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' }),
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
       maxZoom: 19, opacity: 0.9 })],
-  dark: () => [L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    maxZoom: 19, subdomains: 'abcd', attribution: '&copy; OpenStreetMap contributors &copy; CARTO' })],
+  // Esri dark grey canvas (no API key needed, unlike the CARTO tiles).
+  dark: () => [
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 20, maxNativeZoom: 16, attribution: 'Map &copy; Esri, HERE, Garmin, OpenStreetMap contributors' }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 20, maxNativeZoom: 16 })],
 };
 let baseLayers = [];
 function applyMapStyle() {
   baseLayers.forEach((l) => map.removeLayer(l));
   baseLayers = LAYERS[settings.mapStyle]();
-  baseLayers.forEach((l) => l.addTo(map).bringToBack());
+  // Send the layers to the back in reverse order, so the base map ends up below its label layer.
+  baseLayers.slice().reverse().forEach((l) => l.addTo(map).bringToBack());
   document.querySelectorAll('#styleSeg button').forEach((b) => b.classList.toggle('on', b.dataset.style === settings.mapStyle));
   restyleTrails();
 }

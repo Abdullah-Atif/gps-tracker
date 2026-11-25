@@ -2,137 +2,515 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
 <title>Live GPS Tracker</title>
 <!--
-  Live GPS Tracker - serverless web page
-  ---------------------------------------
-  Devices (ESP32 over Wi-Fi or SIM800L) publish their position to a free public
-  MQTT broker. This page subscribes to the broker over secure WebSocket and draws
-  the positions on an OpenStreetMap map. No backend server is needed, so the page
-  can be hosted on any static host (GitHub Pages) or opened as a local file.
+  Live GPS Tracker - serverless web page (v2)
+  -------------------------------------------
+  Devices (ESP32 / ESP32-C3 + SIM800L or Wi-Fi) publish their position to a free
+  public MQTT broker. This page subscribes to the broker over a secure WebSocket
+  and shows the vehicles on a map. There is no backend server, so the page can
+  be hosted on GitHub Pages or opened as a local file.
 
   Topics (TRACKER_KEY is a secret string shared by the devices and this page):
     gpstrk/<TRACKER_KEY>/<device_id>/loc     JSON position, retained
     gpstrk/<TRACKER_KEY>/<device_id>/status  "online" / "offline", retained (offline = last will)
 
-  The tracker key is read from the URL, e.g.  index.html#key=my-secret-key
-  so it is not stored in the source code / repository.
+  The tracker key is read from the link (index.html#key=my-secret-key), so it is
+  never stored in the source code or the repository.
+
+  Features: Bangla / English, light / dark theme, street / satellite / dark map,
+  today's trip statistics, alerts (speed limit, offline, low battery), share link
+  with QR code, navigation to the vehicle with Google Maps.
+
+  Everything the page remembers (trail, trip statistics, settings) is kept in
+  this browser only (localStorage).
+
+  For testing with another broker:  index.html?broker=ws://localhost:8888#key=test
 -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
+  /* ------------------------------------------------------------------ theme */
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7385;
-    --border: #e3e6ec; --accent: #2563eb;
-    --ok: #16a34a; --warn: #d97706; --off: #9ca3af; --bad: #dc2626;
+    --bg: #f1f4f9; --panel: #ffffff; --card: #f6f8fc; --text: #0f172a; --muted: #64748b;
+    --border: #e2e8f0; --accent: #2563eb; --accent-soft: rgba(37, 99, 235, .12); --on-accent: #ffffff;
+    --ok: #16a34a; --warn: #d97706; --off: #94a3b8; --bad: #dc2626;
+    --shadow: 0 10px 30px rgba(15, 23, 42, .12); --radius: 14px;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b1220; --panel: #111a2e; --card: #18233b; --text: #e5e9f2; --muted: #94a3b8;
+    --border: #24314d; --accent: #60a5fa; --accent-soft: rgba(96, 165, 250, .16); --on-accent: #0b1220;
+    --ok: #22c55e; --warn: #f59e0b; --off: #64748b; --bad: #f87171;
+    --shadow: 0 10px 30px rgba(0, 0, 0, .45);
+    color-scheme: dark;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-               color: var(--text); background: var(--bg); }
-  .app { display: flex; height: 100%; }
-  #map { flex: 1; height: 100%; }
-  .panel { width: 340px; background: var(--panel); border-right: 1px solid var(--border);
-           display: flex; flex-direction: column; overflow-y: auto; }
-  .panel header { padding: 16px 18px 12px; border-bottom: 1px solid var(--border); }
-  .panel h1 { font-size: 18px; margin: 0 0 6px; }
-  .conn { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); display: inline-block; flex: none; }
-  .section { padding: 14px 18px; border-bottom: 1px solid var(--border); }
-  .section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
-  .device { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--border);
-            border-radius: 8px; margin-bottom: 8px; cursor: pointer; background: #fff; }
-  .device.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(37,99,235,.15); }
-  .device .name { font-weight: 600; font-size: 14px; }
-  .device .sub { font-size: 12px; color: var(--muted); }
-  .empty { font-size: 13px; color: var(--muted); }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .stat { background: var(--bg); border-radius: 8px; padding: 9px 10px; }
-  .stat .k { font-size: 11px; color: var(--muted); }
-  .stat .v { font-size: 16px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
-  .stat.wide { grid-column: span 2; }
-  .stat .v.small { font-size: 13px; font-weight: 500; }
+  html, body { margin: 0; height: 100%; }
+  body { font-family: "Inter", "Hind Siliguri", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         color: var(--text); background: var(--bg); -webkit-font-smoothing: antialiased; }
+  html[lang="bn"] body { font-family: "Hind Siliguri", "Inter", system-ui, sans-serif; }
+  button, input, select { font: inherit; color: inherit; }
   a { color: var(--accent); }
-  .controls { display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  input[type=text], button { font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 6px;
-                             border: 1px solid var(--border); background: #fff; color: var(--text); }
-  input[type=text] { flex: 1; min-width: 0; }
-  button { cursor: pointer; }
-  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .hint { font-size: 12px; color: var(--muted); line-height: 1.4; }
-  .car-icon svg { width: 34px; height: 34px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.35)); }
+  .num { font-variant-numeric: tabular-nums; }
+  [hidden] { display: none !important; }
+
+  /* ----------------------------------------------------------------- layout */
+  .app { display: flex; height: 100%; }
+  .panel { width: 380px; flex: none; background: var(--panel); border-right: 1px solid var(--border);
+           display: flex; flex-direction: column; overflow: hidden; z-index: 1000; }
+  .panel-scroll { flex: 1; overflow-y: auto; }
+  .map-wrap { flex: 1; position: relative; }
+  #map { position: absolute; inset: 0; background: var(--bg); }
+
+  /* ----------------------------------------------------------------- header */
+  .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+            padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .logo { width: 38px; height: 38px; border-radius: 11px; flex: none; display: grid; place-items: center;
+          background: linear-gradient(135deg, #2563eb, #7c3aed); color: #fff; }
+  .brand h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+  .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); display: inline-block; flex: none; }
+  .dot.pulse { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.8s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(22,163,74,.55); } 70% { box-shadow: 0 0 0 7px rgba(22,163,74,0); } 100% { box-shadow: 0 0 0 0 rgba(22,163,74,0); } }
+  .top-actions { display: flex; gap: 6px; flex: none; }
+  .icon-btn { width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--border); background: var(--card);
+              display: grid; place-items: center; cursor: pointer; padding: 0; }
+  .icon-btn:hover { border-color: var(--accent); }
+  .icon-btn svg { width: 18px; height: 18px; }
+  .lang-btn { width: auto; padding: 0 10px; font-size: 13px; font-weight: 600; }
+
+  /* --------------------------------------------------------------- sections */
+  .section { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .section-title { display: flex; align-items: center; justify-content: space-between; margin: 0 0 10px; }
+  .section-title h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin: 0; }
+  html[lang="bn"] .section-title h2 { text-transform: none; letter-spacing: 0; font-size: 14px; }
+  .link-btn { background: none; border: 0; color: var(--accent); cursor: pointer; font-size: 13px; padding: 2px 4px; }
+
+  /* ---------------------------------------------------------------- devices */
+  .device { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border);
+            border-radius: 12px; margin-bottom: 8px; cursor: pointer; background: var(--card); transition: border-color .15s; }
+  .device:hover { border-color: var(--accent); }
+  .device.selected { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .device .car { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; flex: none; color: #fff; }
+  .device .car svg { width: 18px; height: 18px; }
+  .device .info { min-width: 0; flex: 1; }
+  .device .name { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .device .sub { font-size: 12px; color: var(--muted); }
+  .device .spd { font-weight: 700; font-size: 15px; text-align: right; }
+  .device .spd small { display: block; font-weight: 500; font-size: 11px; color: var(--muted); }
+
+  .empty-card { border: 1px dashed var(--border); border-radius: 12px; padding: 14px; font-size: 13px; color: var(--muted); }
+  .empty-card strong { color: var(--text); display: block; margin-bottom: 6px; font-size: 14px; }
+  .empty-card ol { margin: 8px 0 0; padding-left: 18px; line-height: 1.55; }
+  .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent);
+             display: inline-block; vertical-align: -2px; margin-right: 6px; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------------------------------------------------------------- details */
+  .hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .hero h3 { margin: 0; font-size: 18px; overflow: hidden; text-overflow: ellipsis; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 4px 10px;
+           border-radius: 999px; background: var(--card); border: 1px solid var(--border); white-space: nowrap; }
+  .addr { font-size: 13px; color: var(--muted); margin-top: 4px; line-height: 1.4; min-height: 18px; }
+  .speed-big { display: flex; align-items: baseline; gap: 6px; margin: 12px 0 2px; }
+  .speed-big .v { font-size: 44px; font-weight: 700; line-height: 1; min-width: 28px; }
+  .speed-big .u { font-size: 14px; color: var(--muted); }
+  .updated { font-size: 12px; color: var(--muted); }
+  .actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0; }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 9px 10px; border-radius: 10px;
+         border: 1px solid var(--border); background: var(--card); cursor: pointer; font-size: 13px; font-weight: 600;
+         text-decoration: none; color: var(--text); }
+  .btn:hover { border-color: var(--accent); }
+  .btn svg { width: 16px; height: 16px; flex: none; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .btn[aria-disabled="true"] { opacity: .5; pointer-events: none; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; min-width: 0; }
+  .stat .k { font-size: 11px; color: var(--muted); }
+  html[lang="bn"] .stat .k { font-size: 12px; }
+  .stat .v { font-size: 16px; font-weight: 600; margin-top: 3px; }
+  .stat .s { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .stat.wide { grid-column: span 2; }
+  .stat .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .batt { height: 6px; border-radius: 3px; background: var(--border); margin-top: 6px; overflow: hidden; }
+  .batt > i { display: block; height: 100%; background: var(--ok); width: 0; transition: width .3s; }
+  .copy { background: none; border: 0; cursor: pointer; color: var(--accent); padding: 2px; display: inline-grid; }
+  .copy svg { width: 16px; height: 16px; }
+
+  /* ------------------------------------------------------------------- trip */
+  .trip-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .hint { font-size: 12px; color: var(--muted); line-height: 1.45; margin-top: 8px; }
+
+  /* ----------------------------------------------------------------- alerts */
+  .alert-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; font-size: 14px; }
+  .alert-row + .alert-row { border-top: 1px solid var(--border); }
+  .alert-row .lbl { display: flex; flex-direction: column; }
+  .alert-row .lbl small { color: var(--muted); font-size: 12px; }
+  .inline-num { width: 64px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); text-align: center; }
+  .switch { position: relative; width: 40px; height: 22px; flex: none; display: inline-block; }
+  .sound-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); cursor: pointer; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span { position: absolute; inset: 0; border-radius: 22px; background: var(--border); cursor: pointer; transition: .2s; }
+  .switch span::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: .2s; }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span::before { transform: translateX(18px); }
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .log { list-style: none; margin: 10px 0 0; padding: 0; font-size: 12px; }
+  .log li { display: flex; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); }
+  .log li time { color: var(--muted); flex: none; }
+  .notif-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--accent-soft);
+               border-radius: 10px; padding: 8px 10px; font-size: 12px; margin-bottom: 8px; }
+
+  .foot { padding: 14px 16px 22px; font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 6px; }
+  .key-pill { display: inline-flex; align-items: center; gap: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 3px 8px; font-size: 12px; }
+
+  /* ----------------------------------------------------------- map overlays */
+  .map-controls { position: absolute; top: 12px; right: 12px; z-index: 900; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+  .seg { display: flex; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 3px; box-shadow: var(--shadow); }
+  .seg button { border: 0; background: none; padding: 7px 11px; border-radius: 9px; cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); }
+  .seg button.on { background: var(--accent); color: var(--on-accent); }
+  .fab-col { display: flex; flex-direction: column; gap: 6px; }
+  .fab { width: 40px; height: 40px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text);
+         display: grid; place-items: center; cursor: pointer; box-shadow: var(--shadow); padding: 0; }
+  .fab svg { width: 19px; height: 19px; }
+  .fab.on { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+  .leaflet-container { font: inherit; }
+  .leaflet-control-zoom a { background: var(--panel) !important; color: var(--text) !important; border-color: var(--border) !important; }
+  .leaflet-control-attribution { font-size: 10px; }
+  .veh-icon svg { width: 38px; height: 38px; filter: drop-shadow(0 2px 3px rgba(0,0,0,.35)); }
+  .veh-label { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; font-weight: 600;
+               font-size: 12px; padding: 2px 8px; box-shadow: var(--shadow); }
+  .veh-label::before { display: none; }
+
+  /* ----------------------------------------------------------------- toasts */
+  .toasts { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 1200; display: flex; flex-direction: column;
+            gap: 8px; width: min(420px, calc(100% - 140px)); pointer-events: none; }
+  .toast { pointer-events: auto; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-left: 4px solid var(--accent);
+           border-radius: 12px; padding: 10px 12px; box-shadow: var(--shadow); font-size: 13px; display: flex; gap: 10px; align-items: flex-start;
+           animation: slide .25s ease-out; }
+  .toast.bad { border-left-color: var(--bad); } .toast.warn { border-left-color: var(--warn); } .toast.ok { border-left-color: var(--ok); }
+  .toast button { margin-left: auto; background: none; border: 0; cursor: pointer; color: var(--muted); font-size: 16px; line-height: 1; }
+  @keyframes slide { from { transform: translateY(-8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  /* ----------------------------------------------------------------- modals */
+  .modal { position: fixed; inset: 0; z-index: 3000; background: rgba(2, 6, 23, .55); display: grid; place-items: center; padding: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow); width: min(440px, 100%);
+          padding: 22px; max-height: calc(100% - 32px); overflow-y: auto; }
+  .card h2 { margin: 10px 0 6px; font-size: 20px; }
+  .card p { margin: 0 0 14px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+  .field { display: flex; gap: 8px; }
+  .field input { flex: 1; min-width: 0; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--card); }
+  .field input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+  .card .err { color: var(--bad); font-size: 13px; margin-top: 8px; }
+  .card details { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  .card details summary { cursor: pointer; color: var(--accent); }
+  .card code { font-family: ui-monospace, Menlo, monospace; background: var(--card); padding: 1px 5px; border-radius: 5px; }
+  .qr { display: grid; place-items: center; margin: 14px 0; }
+  .qr > div { background: #fff; padding: 10px; border-radius: 12px; }
+  .warn-note { font-size: 12px; color: var(--warn); margin-top: 10px; }
+  .card-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; flex-wrap: wrap; }
+
+  /* ------------------------------------------------------ mobile (bottom sheet) */
+  .sheet-handle { display: none; }
   @media (max-width: 760px) {
-    .app { flex-direction: column-reverse; }
-    .panel { width: 100%; height: 45%; border-right: none; border-top: 1px solid var(--border); }
-    #map { height: 55%; }
+    .app { display: block; }
+    .map-wrap { position: absolute; left: 0; right: 0; top: 0; bottom: 256px; }
+    .leaflet-control-zoom { display: none; }
+    .panel { position: absolute; left: 0; right: 0; bottom: 0; width: 100%; height: 62%; border-right: 0;
+             border-top-left-radius: 20px; border-top-right-radius: 20px; box-shadow: 0 -8px 30px rgba(0,0,0,.18);
+             transition: height .25s ease; padding-bottom: env(safe-area-inset-bottom); z-index: 1100; }
+    .panel.collapsed { height: 256px; }
+    .sheet-handle { display: block; width: 100%; padding: 8px 0 2px; background: none; border: 0; cursor: pointer; }
+    .sheet-handle i { display: block; width: 42px; height: 5px; border-radius: 3px; background: var(--border); margin: 0 auto; }
+    .topbar { padding-top: 6px; }
+    .map-controls { top: calc(10px + env(safe-area-inset-top)); right: 10px; }
+    .toasts { width: calc(100% - 24px); top: calc(60px + env(safe-area-inset-top)); }
+    .seg button { padding: 6px 9px; font-size: 12px; }
   }
 </style>
 </head>
 <body>
 <div class="app">
-  <aside class="panel">
-    <header>
-      <h1>Live GPS Tracker</h1>
-      <div class="conn"><span class="dot" id="connDot"></span><span id="connText">Not connected</span></div>
+  <!-- ======================= side panel / bottom sheet ======================= -->
+  <aside class="panel" id="panel">
+    <button class="sheet-handle" id="sheetHandle" aria-label="Expand panel"><i></i></button>
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-6-5.33-6-10a6 6 0 1 1 12 0c0 4.67-6 10-6 10z"/><circle cx="12" cy="11" r="2.2"/></svg>
+        </div>
+        <div style="min-width:0">
+          <h1>Live GPS Tracker</h1>
+          <div class="conn"><span class="dot" id="connDot"></span><span id="connText"></span></div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="icon-btn lang-btn" id="langBtn" title="Language"></button>
+        <button class="icon-btn" id="themeBtn"></button>
+        <button class="icon-btn" id="keyBtnTop" data-i18n-title="changeKey">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M17 6l3 3M15 8l2 2"/></svg>
+        </button>
+      </div>
     </header>
 
-    <div class="section" id="keySection">
-      <h2>Tracker key</h2>
-      <div class="controls">
-        <div class="row">
-          <input type="text" id="keyInput" placeholder="Same TRACKER_KEY as in the ESP32 sketch" autocomplete="off">
-          <button class="primary" id="keyBtn">Connect</button>
+    <div class="panel-scroll">
+      <!-- vehicles -->
+      <section class="section">
+        <div class="section-title"><h2 data-i18n="vehicles"></h2></div>
+        <div id="deviceList"></div>
+      </section>
+
+      <!-- selected vehicle -->
+      <section class="section" id="details" hidden>
+        <div class="hero">
+          <div style="min-width:0">
+            <h3 id="dName"></h3>
+            <div class="addr" id="dAddr"></div>
+          </div>
+          <span class="badge" id="dBadge"><span class="dot" id="dBadgeDot"></span><span id="dBadgeText"></span></span>
         </div>
-        <div class="hint">Share this page with the key in the link: <span id="shareHint">…/index.html#key=YOUR_KEY</span></div>
-      </div>
-    </div>
+        <div class="speed-big"><span class="v num" id="dSpeed">–</span><span class="u" id="dSpeedUnit"></span></div>
+        <div class="updated" id="dUpdated"></div>
 
-    <div class="section">
-      <h2>Devices</h2>
-      <div id="deviceList"><div class="empty">Waiting for a device…</div></div>
-    </div>
+        <div class="actions">
+          <a class="btn primary" id="navBtn" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l19-9-9 19-2-8-8-2z"/></svg>
+            <span data-i18n="navigate"></span>
+          </a>
+          <button class="btn" id="shareBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4"/></svg>
+            <span data-i18n="share"></span>
+          </button>
+          <button class="btn" id="centerBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+            <span data-i18n="center"></span>
+          </button>
+        </div>
 
-    <div class="section" id="detailsSection" hidden>
-      <h2 id="detailsTitle">Details</h2>
-      <div class="grid">
-        <div class="stat"><div class="k">Status</div><div class="v small" id="dStatus">–</div></div>
-        <div class="stat"><div class="k">GPS time</div><div class="v small" id="dAgo">–</div></div>
-        <div class="stat"><div class="k">Speed</div><div class="v" id="dSpeed">–</div></div>
-        <div class="stat"><div class="k">Heading</div><div class="v" id="dCourse">–</div></div>
-        <div class="stat"><div class="k">Satellites</div><div class="v" id="dSats">–</div></div>
-        <div class="stat"><div class="k">HDOP</div><div class="v" id="dHdop">–</div></div>
-        <div class="stat wide"><div class="k">Position</div><div class="v small" id="dPos">–</div></div>
-      </div>
-    </div>
+        <div class="grid">
+          <div class="stat"><div class="k" data-i18n="heading"></div><div class="v num" id="dHeading">–</div></div>
+          <div class="stat"><div class="k" data-i18n="gpsSignal"></div><div class="v" id="dGps">–</div><div class="s num" id="dGpsSub"></div></div>
+          <div class="stat"><div class="k" data-i18n="battery"></div><div class="v num" id="dBatt">–</div><div class="batt"><i id="dBattBar"></i></div></div>
+          <div class="stat"><div class="k" data-i18n="altitude"></div><div class="v num" id="dAlt">–</div></div>
+          <div class="stat wide">
+            <div class="k" data-i18n="position"></div>
+            <div class="row"><div class="v num" style="font-size:14px" id="dPos">–</div>
+              <button class="copy" id="copyPos" data-i18n-title="copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+            </div>
+          </div>
+        </div>
+      </section>
 
-    <div class="section">
-      <h2>Map</h2>
-      <div class="controls">
-        <label class="row"><input type="checkbox" id="follow" checked> Follow selected vehicle</label>
-        <div class="row"><button id="clearTrail">Clear trail</button></div>
-        <div class="hint">The trail is kept in this browser only (no server). It survives a page reload.</div>
+      <!-- today's trip -->
+      <section class="section" id="tripSection" hidden>
+        <div class="section-title"><h2 data-i18n="tripToday"></h2><button class="link-btn" id="resetTrip" data-i18n="reset"></button></div>
+        <div class="trip-grid">
+          <div class="stat"><div class="k" data-i18n="distance"></div><div class="v num" id="tDist">–</div></div>
+          <div class="stat"><div class="k" data-i18n="movingTime"></div><div class="v num" id="tMoving">–</div></div>
+          <div class="stat"><div class="k" data-i18n="maxSpeed"></div><div class="v num" id="tMax">–</div></div>
+          <div class="stat"><div class="k" data-i18n="avgSpeed"></div><div class="v num" id="tAvg">–</div></div>
+        </div>
+        <div class="hint" data-i18n="tripHint"></div>
+      </section>
+
+      <!-- alerts -->
+      <section class="section">
+        <div class="section-title"><h2 data-i18n="alerts"></h2><label class="sound-toggle"><span data-i18n="sound"></span><span class="switch"><input type="checkbox" id="soundOn"><span></span></span></label></div>
+        <div class="notif-bar" id="notifBar" hidden>
+          <span data-i18n="notifAsk"></span>
+          <button class="btn" id="notifBtn" style="padding:5px 10px" data-i18n="allow"></button>
+        </div>
+        <div class="alert-row">
+          <div class="lbl"><span data-i18n="alertSpeed"></span><small><span data-i18n="limit"></span>: <input class="inline-num num" type="number" id="speedLimit" min="5" max="200" step="5"> <span class="u-kmh"></span></small></div>
+          <label class="switch"><input type="checkbox" id="speedOn"><span></span></label>
+        </div>
+        <div class="alert-row">
+          <div class="lbl"><span data-i18n="alertOffline"></span><small><span data-i18n="after"></span> <input class="inline-num num" type="number" id="offlineMin" min="1" max="120" step="1"> <span data-i18n="minutes"></span></small></div>
+          <label class="switch"><input type="checkbox" id="offlineOn"><span></span></label>
+        </div>
+        <div class="alert-row">
+          <div class="lbl"><span data-i18n="alertBatt"></span><small data-i18n="alertBattSub"></small></div>
+          <label class="switch"><input type="checkbox" id="battOn"><span></span></label>
+        </div>
+        <ul class="log" id="alertLog"></ul>
+      </section>
+
+      <div class="foot">
+        <div><span data-i18n="keyLabel"></span>: <span class="key-pill" id="keyPill">–</span> <button class="link-btn" id="keyBtnFoot" data-i18n="changeKey"></button></div>
+        <div data-i18n="privacy"></div>
       </div>
     </div>
   </aside>
-  <div id="map"></div>
+
+  <!-- ================================ map ================================ -->
+  <main class="map-wrap">
+    <div id="map"></div>
+    <div class="map-controls">
+      <div class="seg" id="styleSeg">
+        <button data-style="street" data-i18n="street"></button>
+        <button data-style="satellite" data-i18n="satellite"></button>
+        <button data-style="dark" data-i18n="darkMap"></button>
+      </div>
+      <div class="fab-col">
+        <button class="fab" id="followBtn" data-i18n-title="follow">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l19-9-9 19-2-8-8-2z"/></svg>
+        </button>
+        <button class="fab" id="fitBtn" data-i18n-title="showAll">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+        </button>
+        <button class="fab" id="clearTrail" data-i18n-title="clearTrail">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>
+        </button>
+        <button class="fab" id="fsBtn" data-i18n-title="fullscreen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+  </main>
+</div>
+
+<!-- ============================ key modal ============================ -->
+<div class="modal" id="keyModal" hidden>
+  <div class="card" role="dialog" aria-modal="true" aria-labelledby="keyTitle">
+    <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-6-5.33-6-10a6 6 0 1 1 12 0c0 4.67-6 10-6 10z"/><circle cx="12" cy="11" r="2.2"/></svg></div>
+    <h2 id="keyTitle" data-i18n="keyTitle"></h2>
+    <p data-i18n="keyDesc"></p>
+    <div class="field">
+      <input type="text" id="keyInput" autocomplete="off" spellcheck="false" data-i18n-placeholder="keyPlaceholder">
+      <button class="btn primary" id="keyConnect" data-i18n="connect"></button>
+    </div>
+    <div class="err" id="keyErr" hidden></div>
+    <details><summary data-i18n="keyWhere"></summary><p style="margin-top:8px" data-i18n-html="keyWhereText"></p></details>
+    <div class="card-actions" id="keyCancelRow" hidden><button class="btn" id="keyCancel" data-i18n="cancel"></button></div>
+  </div>
+</div>
+
+<!-- ============================ share modal ============================ -->
+<div class="modal" id="shareModal" hidden>
+  <div class="card" role="dialog" aria-modal="true" aria-labelledby="shareTitle">
+    <h2 id="shareTitle" data-i18n="shareTitle"></h2>
+    <p data-i18n="shareDesc"></p>
+    <div class="field">
+      <input type="text" id="shareUrl" readonly>
+      <button class="btn primary" id="copyLink" data-i18n="copy"></button>
+    </div>
+    <div class="qr"><div id="qrBox"></div></div>
+    <div class="card-actions">
+      <a class="btn" id="waBtn" target="_blank" rel="noopener">WhatsApp</a>
+      <button class="btn" id="shareClose" data-i18n="close"></button>
+    </div>
+    <div class="warn-note" data-i18n="shareWarn"></div>
+  </div>
 </div>
 
 <script>
-// ---------------------------------------------------------------------------
+'use strict';
+// =============================================================================
 // Settings
-// ---------------------------------------------------------------------------
-const BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';  // free public broker (secure WebSocket)
+// =============================================================================
+const params = new URLSearchParams(location.search);
+const brokerParam = params.get('broker');
+const BROKER_URL = (brokerParam && /^wss?:\/\//.test(brokerParam)) ? brokerParam
+                 : 'wss://broker.emqx.io:8084/mqtt';   // free public broker (secure WebSocket)
 const TOPIC_PREFIX = 'gpstrk';
-const STALE_AFTER_S = 30;          // no new GPS time for this long -> shown as "last known"
+const STALE_AFTER_S = 30;            // no new GPS time for this long -> "last known position"
 const MAX_TRAIL_POINTS = 3000;
-const MIN_TRAIL_STEP_M = 3;        // ignore GPS jitter smaller than this when drawing the trail
-const DEFAULT_VIEW = [23.7265, 90.3925];
+const MIN_TRAIL_STEP_M = 3;          // ignore GPS jitter smaller than this on the trail
+const DEFAULT_VIEW = [23.7806, 90.4070];   // Dhaka
+const ALERT_GRACE_MS = 15000;        // no alerts during the first seconds after connecting
 
-// ---------------------------------------------------------------------------
+// =============================================================================
+// Text (Bangla / English)
+// =============================================================================
+const I18N = {
+  en: {
+    vehicles: 'Vehicles', notConnected: 'Not connected', connecting: 'Connecting…', live: 'Connected · live',
+    reconnecting: 'Reconnecting…', offlineNet: 'No internet', error: 'Connection error',
+    waitTitle: 'Waiting for your device…', waitTips: [
+      'The tracker is powered on and the Serial Monitor shows “published”.',
+      'The key in this link is exactly the same as TRACKER_KEY in the firmware.',
+      'The SIM has a data pack and the APN is correct.'],
+    stLive: 'Live', stNoFix: 'No GPS fix', stWaiting: 'Online · waiting', stLast: 'Last known', stOffline: 'Offline',
+    updated: 'Updated', never: 'No data yet', ago: { s: 's ago', m: 'min ago', h: 'h ago', d: 'd ago' }, now: 'just now',
+    navigate: 'Navigate', share: 'Share', center: 'Center', heading: 'Heading', gpsSignal: 'GPS signal', battery: 'Battery',
+    altitude: 'Altitude', position: 'Coordinates', copy: 'Copy', copied: 'Copied',
+    q: { exc: 'Excellent', good: 'Good', fair: 'Fair', poor: 'Poor', none: 'No fix' }, sats: 'satellites',
+    tripToday: "Today's trip", reset: 'Reset', distance: 'Distance', movingTime: 'Moving time', maxSpeed: 'Top speed', avgSpeed: 'Average speed',
+    tripHint: 'Counted from the reports this browser received today while the page was open.',
+    alerts: 'Alerts', sound: 'Sound', alertSpeed: 'Over speed limit', limit: 'Limit', alertOffline: 'Device offline', after: 'after',
+    minutes: 'min', alertBatt: 'Low battery', alertBattSub: 'below 3.5 V', notifAsk: 'Get alerts even when this tab is in the background.',
+    allow: 'Allow', noAlerts: 'No alerts yet.',
+    msgSpeed: (n, v, l) => `${n} is at ${v} km/h (limit ${l} km/h)`,
+    msgOffline: (n, m) => `${n} has sent no data for ${m} min`,
+    msgOfflineLwt: (n) => `${n} went offline`,
+    msgBack: (n) => `${n} is back online`,
+    msgBatt: (n, v) => `${n} battery is low (${v} V)`,
+    keyLabel: 'Tracker key', changeKey: 'Change key',
+    privacy: 'Trail, trip and settings are stored only in this browser.',
+    street: 'Street', satellite: 'Satellite', darkMap: 'Dark', follow: 'Follow vehicle', showAll: 'Show all vehicles',
+    clearTrail: 'Clear trail', fullscreen: 'Full screen', trailCleared: 'Trail cleared',
+    keyTitle: 'Connect to your tracker', keyDesc: 'Enter the tracker key. Your vehicles appear on the map as soon as they send their position.',
+    keyPlaceholder: 'Tracker key', connect: 'Connect', cancel: 'Cancel', keyBad: 'The key cannot contain spaces, +, # or /.',
+    keyWhere: 'Where do I find the key?',
+    keyWhereText: 'It is the <code>TRACKER_KEY</code> value in the tracker firmware. You can also open a link like <code>…/gps-tracker/#key=YOUR_KEY</code>.',
+    shareTitle: 'Share live location', shareDesc: 'Anyone who opens this link or scans the QR code sees the vehicle live.',
+    close: 'Close', shareWarn: 'The link contains your tracker key. Share it only with people you trust.',
+    shareText: 'Live location of my vehicle:',
+    themeAuto: 'Theme: automatic', themeLight: 'Theme: light', themeDark: 'Theme: dark',
+    kmh: 'km/h', km: 'km', m: 'm', h: 'h', min: 'min', V: 'V',
+  },
+  bn: {
+    vehicles: 'গাড়ি', notConnected: 'সংযুক্ত নয়', connecting: 'সংযোগ হচ্ছে…', live: 'সংযুক্ত · লাইভ',
+    reconnecting: 'আবার সংযোগ হচ্ছে…', offlineNet: 'ইন্টারনেট নেই', error: 'সংযোগে সমস্যা',
+    waitTitle: 'ডিভাইসের অপেক্ষায়…', waitTips: [
+      'ট্র্যাকার চালু আছে এবং Serial Monitor-এ “published” দেখাচ্ছে।',
+      'এই লিংকের key আর firmware-এর TRACKER_KEY হুবহু এক।',
+      'SIM-এ ডাটা প্যাক আছে এবং APN সঠিক।'],
+    stLive: 'লাইভ', stNoFix: 'GPS সিগন্যাল নেই', stWaiting: 'অনলাইন · অপেক্ষা', stLast: 'সর্বশেষ অবস্থান', stOffline: 'অফলাইন',
+    updated: 'আপডেট', never: 'এখনো ডাটা আসেনি', ago: { s: 'সেকেন্ড আগে', m: 'মিনিট আগে', h: 'ঘণ্টা আগে', d: 'দিন আগে' }, now: 'এইমাত্র',
+    navigate: 'রাস্তা দেখাও', share: 'শেয়ার', center: 'মাঝে আনো', heading: 'দিক', gpsSignal: 'GPS সিগন্যাল', battery: 'ব্যাটারি',
+    altitude: 'উচ্চতা', position: 'স্থানাঙ্ক', copy: 'কপি', copied: 'কপি হয়েছে',
+    q: { exc: 'চমৎকার', good: 'ভালো', fair: 'মোটামুটি', poor: 'দুর্বল', none: 'ফিক্স নেই' }, sats: 'স্যাটেলাইট',
+    tripToday: 'আজকের যাত্রা', reset: 'রিসেট', distance: 'দূরত্ব', movingTime: 'চলার সময়', maxSpeed: 'সর্বোচ্চ গতি', avgSpeed: 'গড় গতি',
+    tripHint: 'পেজ খোলা থাকার সময় এই ব্রাউজারে আজ যত রিপোর্ট এসেছে, তা থেকে হিসাব।',
+    alerts: 'সতর্কবার্তা', sound: 'শব্দ', alertSpeed: 'গতিসীমা পার হলে', limit: 'সীমা', alertOffline: 'ডিভাইস অফলাইন হলে', after: '',
+    minutes: 'মিনিট পর', alertBatt: 'ব্যাটারি কম হলে', alertBattSub: '3.5 V-এর নিচে', notifAsk: 'ট্যাব পেছনে থাকলেও সতর্কবার্তা পেতে অনুমতি দিন।',
+    allow: 'অনুমতি দিন', noAlerts: 'এখনো কোনো সতর্কবার্তা নেই।',
+    msgSpeed: (n, v, l) => `${n} এখন ${v} কিমি/ঘ গতিতে চলছে (সীমা ${l} কিমি/ঘ)`,
+    msgOffline: (n, m) => `${n} থেকে ${m} মিনিট ধরে কোনো ডাটা আসেনি`,
+    msgOfflineLwt: (n) => `${n} অফলাইন হয়ে গেছে`,
+    msgBack: (n) => `${n} আবার অনলাইনে এসেছে`,
+    msgBatt: (n, v) => `${n}-এর ব্যাটারি কম (${v} V)`,
+    keyLabel: 'ট্র্যাকার key', changeKey: 'Key বদলাও',
+    privacy: 'Trail, যাত্রার হিসাব আর সেটিংস শুধু এই ব্রাউজারে থাকে।',
+    street: 'রাস্তা', satellite: 'স্যাটেলাইট', darkMap: 'ডার্ক', follow: 'গাড়ি অনুসরণ', showAll: 'সব গাড়ি দেখাও',
+    clearTrail: 'Trail মুছে ফেলো', fullscreen: 'ফুল স্ক্রিন', trailCleared: 'Trail মুছে ফেলা হয়েছে',
+    keyTitle: 'আপনার ট্র্যাকারে সংযোগ দিন', keyDesc: 'ট্র্যাকারের key লিখুন। গাড়ি অবস্থান পাঠালেই ম্যাপে দেখা যাবে।',
+    keyPlaceholder: 'ট্র্যাকার key', connect: 'সংযোগ', cancel: 'বাতিল', keyBad: 'Key-তে space, +, # বা / থাকতে পারবে না।',
+    keyWhere: 'Key কোথায় পাব?',
+    keyWhereText: 'ট্র্যাকারের firmware-এ <code>TRACKER_KEY</code>-এর মানটাই key। চাইলে <code>…/gps-tracker/#key=আপনার_KEY</code> এরকম লিংকও খুলতে পারেন।',
+    shareTitle: 'লাইভ লোকেশন শেয়ার', shareDesc: 'এই লিংক খুললে বা QR কোড স্ক্যান করলে যে কেউ গাড়িটি লাইভ দেখতে পারবে।',
+    close: 'বন্ধ করো', shareWarn: 'লিংকে আপনার ট্র্যাকার key আছে। শুধু বিশ্বস্ত মানুষের সাথে শেয়ার করুন।',
+    shareText: 'আমার গাড়ির লাইভ লোকেশন:',
+    themeAuto: 'থিম: স্বয়ংক্রিয়', themeLight: 'থিম: লাইট', themeDark: 'থিম: ডার্ক',
+    kmh: 'কিমি/ঘ', km: 'কিমি', m: 'মি', h: 'ঘ', min: 'মি', V: 'V',
+  },
+};
+
+// =============================================================================
 // Small helpers
-// ---------------------------------------------------------------------------
+// =============================================================================
 const $ = (id) => document.getElementById(id);
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
@@ -140,69 +518,167 @@ const store = {
 };
 const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
 
-function distM(a, b) {               // haversine distance in meters
+const DEFAULT_SETTINGS = {
+  lang: (navigator.language || '').startsWith('bn') ? 'bn' : 'en',
+  theme: 'auto', mapStyle: 'street', follow: true, sound: true,
+  speedOn: true, speedLimit: 60, offlineOn: true, offlineMin: 5, battOn: true,
+};
+const settings = Object.assign({}, DEFAULT_SETTINGS, store.get('settings') || {});
+const saveSettings = () => store.set('settings', settings);
+
+function t(key) { const v = I18N[settings.lang][key]; return v !== undefined ? v : I18N.en[key]; }
+const BN_DIGITS = '০১২৩৪৫৬৭৮৯';
+function nd(x) {                      // localized digits
+  const s = String(x);
+  return settings.lang === 'bn' ? s.replace(/[0-9]/g, (c) => BN_DIGITS[c]) : s;
+}
+function fmt(v, digits) { return nd(v.toFixed(digits)); }
+
+function distM(a, b) {               // haversine distance in metres
   const R = 6371000, r = Math.PI / 180;
   const dLat = (b[0] - a[0]) * r, dLng = (b[1] - a[1]) * r;
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * r) * Math.cos(b[0] * r) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(h));
 }
-function compass(deg) { return ['N','NE','E','SE','S','SW','W','NW'][Math.round(deg / 45) % 8]; }
+function compass(deg) {
+  const en = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  const bn = ['উত্তর', 'উত্তর-পূর্ব', 'পূর্ব', 'দক্ষিণ-পূর্ব', 'দক্ষিণ', 'দক্ষিণ-পশ্চিম', 'পশ্চিম', 'উত্তর-পশ্চিম'];
+  return (settings.lang === 'bn' ? bn : en)[Math.round(deg / 45) % 8];
+}
 function agoText(ms) {
-  if (ms == null) return '–';
-  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (s < 60) return s + ' s ago';
-  if (s < 3600) return Math.floor(s / 60) + ' min ago';
-  if (s < 86400) return Math.floor(s / 3600) + ' h ago';
-  return Math.floor(s / 86400) + ' d ago';
+  if (ms == null) return t('never');
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000)), a = t('ago');
+  if (s < 5) return t('now');
+  if (s < 60) return nd(s) + ' ' + a.s;
+  if (s < 3600) return nd(Math.floor(s / 60)) + ' ' + a.m;
+  if (s < 86400) return nd(Math.floor(s / 3600)) + ' ' + a.h;
+  return nd(Math.floor(s / 86400)) + ' ' + a.d;
+}
+function durText(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return h ? `${nd(h)} ${t('h')} ${nd(m)} ${t('min')}` : `${nd(m)} ${t('min')}`;
+}
+function battPercent(mv) {           // 1S Li-ion, resting-voltage curve (approximate)
+  const pts = [[3300, 0], [3400, 5], [3500, 10], [3600, 20], [3700, 35], [3800, 50], [3900, 65], [4000, 80], [4100, 90], [4200, 100]];
+  if (mv <= pts[0][0]) return 0;
+  if (mv >= pts[pts.length - 1][0]) return 100;
+  for (let i = 1; i < pts.length; i++) {
+    if (mv <= pts[i][0]) {
+      const [x0, y0] = pts[i - 1], [x1, y1] = pts[i];
+      return Math.round(y0 + (y1 - y0) * (mv - x0) / (x1 - x0));
+    }
+  }
+  return 0;
+}
+function gpsQuality(d) {
+  if (!d.fix) return { label: t('q').none, color: 'var(--bad)' };
+  const h = d.hdop;
+  if (h == null) return { label: t('q').good, color: 'var(--ok)' };
+  if (h < 1.5) return { label: t('q').exc, color: 'var(--ok)' };
+  if (h < 3) return { label: t('q').good, color: 'var(--ok)' };
+  if (h < 6) return { label: t('q').fair, color: 'var(--warn)' };
+  return { label: t('q').poor, color: 'var(--bad)' };
+}
+function todayStr() { const d = new Date(); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; }
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* fall back below */ }
+  try {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+    ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok;
+  } catch (e) { return false; }
 }
 
-// ---------------------------------------------------------------------------
-// Map
-// ---------------------------------------------------------------------------
-const map = L.map('map').setView(DEFAULT_VIEW, 13);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
-}).addTo(map);
+// =============================================================================
+// Theme, language
+// =============================================================================
+const THEME_ICONS = {
+  auto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg>',
+  light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+  dark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>',
+};
+const darkQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+function applyTheme() {
+  const dark = settings.theme === 'dark' || (settings.theme === 'auto' && darkQuery && darkQuery.matches);
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  document.querySelector('meta[name=theme-color]').content = dark ? '#0b1220' : '#ffffff';
+  $('themeBtn').innerHTML = THEME_ICONS[settings.theme];
+  $('themeBtn').title = t({ auto: 'themeAuto', light: 'themeLight', dark: 'themeDark' }[settings.theme]);
+  restyleTrails();
+}
+if (darkQuery && darkQuery.addEventListener) darkQuery.addEventListener('change', () => settings.theme === 'auto' && applyTheme());
 
-const state = { key: null, devices: {}, markers: {}, trails: {}, selected: null, firstFixShown: false };
+function applyLanguage() {
+  document.documentElement.lang = settings.lang;
+  document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll('[data-i18n-title]').forEach((el) => { el.title = t(el.dataset.i18nTitle); el.setAttribute('aria-label', el.title); });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach((el) => { el.placeholder = t(el.dataset.i18nPlaceholder); });
+  document.querySelectorAll('[data-i18n-html]').forEach((el) => { el.innerHTML = t(el.dataset.i18nHtml); });  // trusted, static text only
+  document.querySelectorAll('.u-kmh').forEach((el) => { el.textContent = t('kmh'); });
+  $('langBtn').textContent = settings.lang === 'bn' ? 'EN' : 'বাং';
+  $('langBtn').title = settings.lang === 'bn' ? 'Switch to English' : 'বাংলায় দেখুন';
+  $('themeBtn').title = t({ auto: 'themeAuto', light: 'themeLight', dark: 'themeDark' }[settings.theme]);
+  refreshConnText();
+  renderAll();
+  renderLog();
+}
+
+// =============================================================================
+// Map
+// =============================================================================
+const map = L.map('map', { zoomControl: true, attributionControl: true }).setView(DEFAULT_VIEW, 12);
+map.zoomControl.setPosition('bottomright');
+const LAYERS = {
+  // CARTO "Voyager" street map (OpenStreetMap data). Unlike tile.openstreetmap.org it also
+  // works when the page is opened as a local file (OSM blocks requests without a Referer).
+  street: () => [L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    maxZoom: 20, subdomains: 'abcd', attribution: '&copy; OpenStreetMap contributors &copy; CARTO' })],
+  satellite: () => [
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' }),
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19, opacity: 0.9 })],
+  dark: () => [L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 19, subdomains: 'abcd', attribution: '&copy; OpenStreetMap contributors &copy; CARTO' })],
+};
+let baseLayers = [];
+function applyMapStyle() {
+  baseLayers.forEach((l) => map.removeLayer(l));
+  baseLayers = LAYERS[settings.mapStyle]();
+  baseLayers.forEach((l) => l.addTo(map).bringToBack());
+  document.querySelectorAll('#styleSeg button').forEach((b) => b.classList.toggle('on', b.dataset.style === settings.mapStyle));
+  restyleTrails();
+}
+
+// =============================================================================
+// State
+// =============================================================================
+const state = { key: null, devices: {}, markers: {}, trails: {}, selected: null, firstFixShown: false,
+                connected: false, connectedAt: 0, connState: 'notConnected' };
+const alertLog = [];
 
 function statusOf(d) {
-  if (d.online === false) return { text: 'Offline', hex: '#9ca3af' };
+  if (d.online === false) return { key: 'stOffline', color: 'var(--off)', hex: '#94a3b8' };
   const fresh = d.gpsMs != null && Date.now() - d.gpsMs < STALE_AFTER_S * 1000;
-  if (!fresh) return d.online ? { text: 'Online · waiting for data', hex: '#d97706' }
-                              : { text: 'Last known position', hex: '#9ca3af' };
-  if (!d.fix) return { text: 'Online · no GPS fix', hex: '#d97706' };
-  return { text: 'Online · live', hex: '#16a34a' };
+  if (!fresh) return d.online ? { key: 'stWaiting', color: 'var(--warn)', hex: '#d97706' }
+                              : { key: 'stLast', color: 'var(--off)', hex: '#94a3b8' };
+  if (!d.fix) return { key: 'stNoFix', color: 'var(--warn)', hex: '#d97706' };
+  return { key: 'stLive', color: 'var(--ok)', hex: '#16a34a' };
+}
+function isFresh(d) { return d.gpsMs != null && Date.now() - d.gpsMs < STALE_AFTER_S * 1000; }
+
+function device(id) {
+  if (!state.devices[id]) state.devices[id] = { id, online: null, fix: false, lastMsgMs: null, seenLive: false };
+  if (!state.selected) state.selected = id;
+  return state.devices[id];
 }
 
-function arrowIcon(color, course) {
-  const svg = `<svg viewBox="0 0 40 40" style="transform: rotate(${course || 0}deg)">
-      <circle cx="20" cy="20" r="17" fill="white" stroke="${color}" stroke-width="3"/>
-      <path d="M20 7 L29 29 L20 24 L11 29 Z" fill="${color}"/></svg>`;
-  return L.divIcon({ className: 'car-icon', html: svg, iconSize: [34, 34], iconAnchor: [17, 17] });
+// --------------------------------------------------------------- markers
+function vehicleIcon(color, course) {
+  const svg = `<svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="18" fill="${color}" opacity=".18"/>
+      <circle cx="20" cy="20" r="13" fill="white" stroke="${color}" stroke-width="3"/>
+      <g transform="rotate(${course || 0} 20 20)"><path d="M20 11 L26 27 L20 23.5 L14 27 Z" fill="${color}"/></g></svg>`;
+  return L.divIcon({ className: 'veh-icon', html: svg, iconSize: [38, 38], iconAnchor: [19, 19] });
 }
-
-function trailKey(id) { return `trail:${state.key}:${id}`; }
-
-function trailOf(id) {
-  if (!state.trails[id]) {
-    const saved = store.get(trailKey(id)) || [];
-    state.trails[id] = L.polyline(saved, { color: '#2563eb', weight: 4, opacity: 0.75 }).addTo(map);
-  }
-  return state.trails[id];
-}
-
-function appendTrail(id, ll) {
-  const t = trailOf(id);
-  const pts = t.getLatLngs();
-  const last = pts.length ? [pts[pts.length - 1].lat, pts[pts.length - 1].lng] : null;
-  if (last && distM(last, ll) < MIN_TRAIL_STEP_M) return;
-  t.addLatLng(ll);
-  let arr = t.getLatLngs().map(p => [p.lat, p.lng]);
-  if (arr.length > MAX_TRAIL_POINTS) { arr = arr.slice(-MAX_TRAIL_POINTS); t.setLatLngs(arr); }
-  store.set(trailKey(id), arr);
-}
-
 function updateMarker(id) {
   const d = state.devices[id];
   if (d.lat == null) return;
@@ -210,125 +686,343 @@ function updateMarker(id) {
   const iconKey = st.hex + '|' + Math.round(d.course || 0);
   let m = state.markers[id];
   if (!m) {
-    m = state.markers[id] = L.marker([d.lat, d.lng], { icon: arrowIcon(st.hex, d.course) })
-      .addTo(map).bindTooltip(id).on('click', () => selectDevice(id, false));
+    m = state.markers[id] = L.marker([d.lat, d.lng], { icon: vehicleIcon(st.hex, d.course), keyboard: false })
+      .addTo(map).on('click', () => selectDevice(id, false));
+    m.bindTooltip(id, { permanent: true, direction: 'top', offset: [0, -18], className: 'veh-label' });
   } else {
     m.setLatLng([d.lat, d.lng]);
-    if (m._iconKey !== iconKey) m.setIcon(arrowIcon(st.hex, d.course));
+    if (m._iconKey !== iconKey) m.setIcon(vehicleIcon(st.hex, d.course));
   }
   m._iconKey = iconKey;
 }
 
+// ----------------------------------------------------------------- trail
+function trailColor() {
+  if (settings.mapStyle === 'satellite') return '#facc15';
+  return document.documentElement.dataset.theme === 'dark' || settings.mapStyle === 'dark' ? '#60a5fa' : '#2563eb';
+}
+function restyleTrails() { for (const id in state.trails) state.trails[id].setStyle({ color: trailColor() }); }
+function trailKey(id) { return `trail:${state.key}:${id}`; }
+function trailOf(id) {
+  if (!state.trails[id]) {
+    const saved = store.get(trailKey(id)) || [];
+    state.trails[id] = L.polyline(saved, { color: trailColor(), weight: 4, opacity: 0.8, lineJoin: 'round' }).addTo(map);
+  }
+  return state.trails[id];
+}
+function appendTrail(id, ll) {
+  const tr = trailOf(id);
+  const pts = tr.getLatLngs();
+  const last = pts.length ? [pts[pts.length - 1].lat, pts[pts.length - 1].lng] : null;
+  if (last && distM(last, ll) < MIN_TRAIL_STEP_M) return;
+  tr.addLatLng(ll);
+  let arr = tr.getLatLngs().map((p) => [p.lat, p.lng]);
+  if (arr.length > MAX_TRAIL_POINTS) { arr = arr.slice(-MAX_TRAIL_POINTS); tr.setLatLngs(arr); }
+  store.set(trailKey(id), arr);
+}
+
+// ------------------------------------------------------------ today's trip
+function tripKey(id) { return `trip:${state.key}:${id}:${todayStr()}`; }
+function tripOf(id) { return store.get(tripKey(id)) || { dist: 0, max: 0, moving: 0, last: null }; }
+function updateTrip(id, lat, lng, gpsMs, speed) {
+  const tr = tripOf(id);
+  if (tr.last && gpsMs <= tr.last.ms) return;          // already counted (e.g. retained message after reload)
+  if (tr.last) {
+    const dt = (gpsMs - tr.last.ms) / 1000;
+    if (dt > 0 && dt < 120) {                          // ignore gaps (page closed, no signal)
+      const d = distM([tr.last.lat, tr.last.lng], [lat, lng]);
+      const v = d / dt * 3.6;
+      if (d >= 5 && v < 200) tr.dist += d;
+      if ((speed != null ? speed : v) >= 3) tr.moving += dt;
+    }
+  }
+  if (speed != null && speed < 200) tr.max = Math.max(tr.max, speed);
+  tr.last = { lat, lng, ms: gpsMs };
+  store.set(tripKey(id), tr);
+}
+
+// ----------------------------------------------------------------- address
+const geo = { lastLL: null, lastMs: 0, busy: false, text: '' , id: null};
+function maybeGeocode(d) {
+  if (!d || d.lat == null || geo.busy) return;
+  const ll = [d.lat, d.lng];
+  if (geo.id === d.id && geo.lastLL && distM(geo.lastLL, ll) < 100) return;
+  if (Date.now() - geo.lastMs < 30000) return;           // be gentle with the free geocoding service
+  geo.busy = true; geo.lastMs = Date.now();
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=17&lat=${ll[0]}&lon=${ll[1]}&accept-language=${settings.lang}`;
+  fetch(url).then((r) => r.ok ? r.json() : null).then((j) => {
+    if (j && j.display_name) {
+      geo.text = j.display_name.split(',').slice(0, 3).join(',').trim();
+      geo.lastLL = ll; geo.id = d.id;
+      renderDetails();
+    }
+  }).catch(() => { /* address is optional */ }).finally(() => { geo.busy = false; });
+}
+
+// =============================================================================
+// Rendering
+// =============================================================================
+const CAR_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17h14M6 17v2M18 17v2M3 13l2-6h14l2 6v4H3z"/><circle cx="7.5" cy="14" r="1"/><circle cx="16.5" cy="14" r="1"/></svg>';
+
 function renderDeviceList() {
-  const ids = Object.keys(state.devices).sort();
-  if (!ids.length) return;
   const list = $('deviceList');
-  list.innerHTML = '';
+  const ids = Object.keys(state.devices).sort();
+  list.textContent = '';
+  if (!ids.length) {
+    const card = document.createElement('div'); card.className = 'empty-card';
+    const strong = document.createElement('strong');
+    if (state.connected) { const sp = document.createElement('span'); sp.className = 'spinner'; strong.appendChild(sp); }
+    strong.appendChild(document.createTextNode(state.key ? t('waitTitle') : t('notConnected')));
+    card.appendChild(strong);
+    if (state.key) {
+      const ol = document.createElement('ol');
+      t('waitTips').forEach((tip) => { const li = document.createElement('li'); li.textContent = tip; ol.appendChild(li); });
+      card.appendChild(ol);
+    }
+    list.appendChild(card);
+    return;
+  }
   for (const id of ids) {
     const d = state.devices[id], st = statusOf(d);
     const el = document.createElement('div');
     el.className = 'device' + (id === state.selected ? ' selected' : '');
-    const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = st.hex;
-    const box = document.createElement('div');
+    el.tabIndex = 0;
+    const car = document.createElement('div'); car.className = 'car'; car.style.background = st.hex; car.innerHTML = CAR_SVG;
+    const info = document.createElement('div'); info.className = 'info';
     const name = document.createElement('div'); name.className = 'name'; name.textContent = id;
     const sub = document.createElement('div'); sub.className = 'sub';
-    sub.textContent = st.text + ' · ' + agoText(d.gpsMs);
-    box.append(name, sub); el.append(dot, box);
+    sub.textContent = t(st.key) + ' · ' + agoText(d.gpsMs || d.lastMsgMs);
+    info.append(name, sub);
+    const spd = document.createElement('div'); spd.className = 'spd num';
+    if (d.speed_kmh != null && isFresh(d) && d.fix && d.online !== false) {
+      spd.textContent = fmt(d.speed_kmh, 0);
+      const s = document.createElement('small'); s.textContent = t('kmh'); spd.appendChild(s);
+    }
+    el.append(car, info, spd);
     el.onclick = () => selectDevice(id, true);
+    el.onkeydown = (e) => { if (e.key === 'Enter') selectDevice(id, true); };
     list.appendChild(el);
   }
 }
 
 function renderDetails() {
   const d = state.devices[state.selected];
-  if (!d) { $('detailsSection').hidden = true; return; }
-  $('detailsSection').hidden = false;
-  $('detailsTitle').textContent = d.id;
+  $('details').hidden = !d; $('tripSection').hidden = !d;
+  if (!d) return;
   const st = statusOf(d);
-  $('dStatus').textContent = st.text; $('dStatus').style.color = st.hex;
-  $('dAgo').textContent = agoText(d.gpsMs);
-  $('dSpeed').textContent = d.speed_kmh != null ? d.speed_kmh.toFixed(1) + ' km/h' : '–';
-  $('dCourse').textContent = d.course != null ? Math.round(d.course) + '° ' + compass(d.course) : '–';
-  $('dSats').textContent = d.sats != null ? d.sats : '–';
-  $('dHdop').textContent = d.hdop != null ? d.hdop.toFixed(2) : '–';
-  const pos = $('dPos'); pos.textContent = '';
-  if (d.lat != null) {
-    const a = document.createElement('a');
-    a.href = `https://maps.google.com/?q=${d.lat},${d.lng}`; a.target = '_blank'; a.rel = 'noopener';
-    a.textContent = d.lat.toFixed(6) + ', ' + d.lng.toFixed(6);
-    pos.appendChild(a);
-  } else pos.textContent = 'No position yet';
+  $('dName').textContent = d.id;
+  $('dBadgeDot').style.background = st.hex;
+  $('dBadgeText').textContent = t(st.key);
+  $('dAddr').textContent = (geo.id === d.id && geo.text) ? geo.text : '';
+  const live = isFresh(d) && d.fix && d.online !== false;
+  $('dSpeed').textContent = live && d.speed_kmh != null ? fmt(d.speed_kmh, 0) : '–';
+  $('dSpeedUnit').textContent = t('kmh');
+  $('dUpdated').textContent = t('updated') + ': ' + agoText(d.gpsMs || d.lastMsgMs);
+  $('dHeading').textContent = d.course != null && live ? `${nd(Math.round(d.course))}° ${compass(d.course)}` : '–';
+  const q = gpsQuality(d);
+  $('dGps').textContent = q.label; $('dGps').style.color = q.color;
+  $('dGpsSub').textContent = d.sats != null ? `${nd(d.sats)} ${t('sats')}` + (d.hdop != null ? ` · HDOP ${fmt(d.hdop, 1)}` : '') : '';
+  if (d.batt_mv != null) {
+    const p = battPercent(d.batt_mv);
+    $('dBatt').textContent = `${nd(p)}% · ${fmt(d.batt_mv / 1000, 2)} V`;
+    $('dBattBar').style.width = p + '%';
+    $('dBattBar').style.background = p < 20 ? 'var(--bad)' : p < 40 ? 'var(--warn)' : 'var(--ok)';
+  } else { $('dBatt').textContent = '–'; $('dBattBar').style.width = '0'; }
+  $('dAlt').textContent = d.alt_m != null ? `${fmt(d.alt_m, 0)} ${t('m')}` : '–';
+  $('dPos').textContent = d.lat != null ? `${fmt(d.lat, 6)}, ${fmt(d.lng, 6)}` : '–';
+  const nav = $('navBtn');
+  if (d.lat != null) { nav.href = `https://www.google.com/maps/dir/?api=1&destination=${d.lat},${d.lng}`; nav.removeAttribute('aria-disabled'); }
+  else { nav.removeAttribute('href'); nav.setAttribute('aria-disabled', 'true'); }
+  $('centerBtn').disabled = d.lat == null;
+  renderTrip();
+}
+
+function renderTrip() {
+  const id = state.selected; if (!id) return;
+  const tr = tripOf(id);
+  $('tDist').textContent = tr.dist >= 1000 ? `${fmt(tr.dist / 1000, 2)} ${t('km')}` : `${nd(Math.round(tr.dist))} ${t('m')}`;
+  $('tMoving').textContent = durText(tr.moving);
+  $('tMax').textContent = tr.max ? `${fmt(tr.max, 0)} ${t('kmh')}` : '–';
+  $('tAvg').textContent = tr.moving > 60 ? `${fmt(tr.dist / tr.moving * 3.6, 0)} ${t('kmh')}` : '–';
+}
+
+function renderAll() {
+  renderDeviceList(); renderDetails();
+  $('keyPill').textContent = state.key || '–';
+  $('followBtn').classList.toggle('on', settings.follow);
 }
 
 function selectDevice(id, pan) {
   state.selected = id;
   const d = state.devices[id];
   if (pan && d && d.lat != null) map.setView([d.lat, d.lng], Math.max(map.getZoom(), 16));
-  renderDeviceList(); renderDetails();
+  renderAll(); maybeGeocode(d);
+  if (window.innerWidth <= 760 && pan) $('panel').classList.add('collapsed');
 }
 
-function device(id) {
-  if (!state.devices[id]) state.devices[id] = { id, online: null, fix: false };
-  if (!state.selected) state.selected = id;
-  return state.devices[id];
+// =============================================================================
+// Alerts
+// =============================================================================
+let audioCtx = null;
+function beep(kind) {
+  if (!settings.sound) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const tones = kind === 'ok' ? [660, 880] : [880, 660, 880];
+    tones.forEach((f, i) => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = f; o.type = 'sine';
+      g.gain.setValueAtTime(0.0001, audioCtx.currentTime + i * 0.18);
+      g.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + i * 0.18 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + i * 0.18 + 0.16);
+      o.connect(g).connect(audioCtx.destination); o.start(audioCtx.currentTime + i * 0.18); o.stop(audioCtx.currentTime + i * 0.18 + 0.17);
+    });
+  } catch (e) { /* audio not available */ }
+}
+function unlockAudio() {             // browsers only allow sound after a user gesture
+  try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); audioCtx.resume(); } catch (e) { /* ignore */ }
+}
+document.addEventListener('pointerdown', unlockAudio, { once: true });
+function toast(text, kind = 'info', ms = 6000) {
+  const el = document.createElement('div'); el.className = 'toast ' + kind;
+  const span = document.createElement('span'); span.textContent = text;
+  const x = document.createElement('button'); x.textContent = '×'; x.setAttribute('aria-label', 'close'); x.onclick = () => el.remove();
+  el.append(span, x); $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+function fireAlert(make, kind) {          // make() builds the text in the current language
+  const text = make();
+  alertLog.unshift({ ms: Date.now(), make, kind }); alertLog.length = Math.min(alertLog.length, 20);
+  toast(text, kind, kind === 'ok' ? 5000 : 9000);
+  beep(kind);
+  renderLog();
+  if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
+    try { new Notification('Live GPS Tracker', { body: text, tag: 'gps-alert' }); } catch (e) { /* ignore */ }
+  }
+}
+function renderLog() {
+  const ul = $('alertLog'); ul.textContent = '';
+  if (!alertLog.length) { const li = document.createElement('li'); li.style.color = 'var(--muted)'; li.textContent = t('noAlerts'); ul.appendChild(li); return; }
+  alertLog.slice(0, 6).forEach((a) => {
+    const li = document.createElement('li');
+    const tm = document.createElement('time');
+    const dt = new Date(a.ms);
+    tm.textContent = nd(String(dt.getHours()).padStart(2, '0') + ':' + String(dt.getMinutes()).padStart(2, '0'));
+    const s = document.createElement('span'); s.textContent = a.make();
+    s.style.color = a.kind === 'bad' ? 'var(--bad)' : a.kind === 'warn' ? 'var(--warn)' : 'var(--text)';
+    li.append(tm, s); ul.appendChild(li);
+  });
+}
+function checkAlerts(id) {
+  const d = state.devices[id];
+  if (!d || !state.connected || Date.now() - state.connectedAt < ALERT_GRACE_MS) return;
+  d.alerts = d.alerts || { over: false, off: false, batt: false };
+  const a = d.alerts;
+  // speed limit
+  if (settings.speedOn && d.fix && isFresh(d) && d.speed_kmh != null) {
+    if (!a.over && d.speed_kmh > settings.speedLimit) {
+      a.over = true; const v = Math.round(d.speed_kmh), l = settings.speedLimit; fireAlert(() => t('msgSpeed')(id, nd(v), nd(l)), 'bad');
+    } else if (a.over && d.speed_kmh < settings.speedLimit - 5) a.over = false;
+  }
+  // offline (only for a device that was live while this page was open)
+  if (settings.offlineOn && d.seenLive) {
+    const silentMs = Date.now() - (d.lastMsgMs || 0);
+    if (!a.off && (d.online === false || silentMs > settings.offlineMin * 60000)) {
+      a.off = true;
+      const lwt = d.online === false, m = settings.offlineMin;
+      fireAlert(() => lwt ? t('msgOfflineLwt')(id) : t('msgOffline')(id, nd(m)), 'warn');
+    }
+  }
+  // low battery
+  if (settings.battOn && d.batt_mv != null) {
+    if (!a.batt && d.batt_mv < 3500) { a.batt = true; const mv = d.batt_mv; fireAlert(() => t('msgBatt')(id, fmt(mv / 1000, 2)), 'warn'); }
+    else if (a.batt && d.batt_mv > 3650) a.batt = false;
+  }
+}
+function updateNotifBar() {
+  const show = 'Notification' in window && Notification.permission === 'default' &&
+               (settings.speedOn || settings.offlineOn || settings.battOn);
+  $('notifBar').hidden = !show;
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // Incoming MQTT messages
-// ---------------------------------------------------------------------------
+// =============================================================================
 function onLocation(id, msg, retained) {
   const d = device(id);
+  if (!retained) d.lastMsgMs = Date.now();
   d.fix = msg.fix === true;
   d.sats = num(msg.sats); d.hdop = num(msg.hdop);
-  const t = typeof msg.gps_time === 'string' ? Date.parse(msg.gps_time) : NaN;
-  d.gpsMs = isNaN(t) ? (retained ? null : Date.now()) : t;
+  if (num(msg.batt_mv) != null) d.batt_mv = num(msg.batt_mv);
+  const tm = typeof msg.gps_time === 'string' ? Date.parse(msg.gps_time) : NaN;
+  d.gpsMs = isNaN(tm) ? (retained ? null : Date.now()) : tm;
+  if (!retained && d.alerts && d.alerts.off) { d.alerts.off = false; fireAlert(() => t('msgBack')(id), 'ok'); }
   const lat = num(msg.lat), lng = num(msg.lng);
   if (d.fix && lat != null && lng != null && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
     d.lat = lat; d.lng = lng;
-    d.speed_kmh = num(msg.speed_kmh); d.course = num(msg.course);
-    trailOf(id);                     // restore saved trail first
+    d.speed_kmh = num(msg.speed_kmh); d.course = num(msg.course); d.alt_m = num(msg.alt_m);
+    trailOf(id);
     appendTrail(id, [lat, lng]);
-    if (!state.firstFixShown) { map.setView([lat, lng], 17); state.firstFixShown = true; }
-    else if ($('follow').checked && state.selected === id) map.panTo([lat, lng]);
-  }
-  updateMarker(id); renderDeviceList(); renderDetails();
+    if (d.gpsMs != null) updateTrip(id, lat, lng, d.gpsMs, d.speed_kmh);
+    if (isFresh(d) && !retained) d.seenLive = true;
+    if (!state.firstFixShown) { map.setView([lat, lng], 16); state.firstFixShown = true; }
+    else if (settings.follow && state.selected === id) map.panTo([lat, lng], { animate: true });
+    if (state.selected === id) maybeGeocode(d);
+  } else if (!retained && isFresh(d)) d.seenLive = true;
+  updateMarker(id); renderAll(); checkAlerts(id);
 }
-
-function onStatus(id, text) {
+function onStatus(id, text, retained) {
   const d = device(id);
+  const wasOnline = d.online;
   d.online = text === 'online';
+  if (!retained) d.lastMsgMs = Date.now();
   if (d.lat != null) updateMarker(id);
-  renderDeviceList(); renderDetails();
+  if (d.online && wasOnline === false && d.alerts && d.alerts.off) { d.alerts.off = false; fireAlert(() => t('msgBack')(id), 'ok'); }
+  renderAll(); checkAlerts(id);
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // MQTT connection
-// ---------------------------------------------------------------------------
+// =============================================================================
 let client = null;
-
-function setConn(color, text) { $('connDot').style.background = color; $('connText').textContent = text; }
-
+const CONN = {
+  notConnected: ['var(--off)', 'notConnected'], connecting: ['var(--warn)', 'connecting'], live: ['var(--ok)', 'live'],
+  reconnecting: ['var(--warn)', 'reconnecting'], offlineNet: ['var(--bad)', 'offlineNet'], error: ['var(--bad)', 'error'],
+};
+function setConn(s) { state.connState = s; refreshConnText(); }
+function refreshConnText() {
+  const [color, key] = CONN[state.connState];
+  $('connDot').style.background = color;
+  $('connDot').classList.toggle('pulse', state.connState === 'live');
+  $('connText').textContent = t(key);
+}
 function connect(key) {
   if (client) { client.end(true); client = null; }
-  state.key = key;
+  if (typeof mqtt === 'undefined') { setConn('error'); return; }
+  state.key = key; state.devices = {}; state.selected = null; state.firstFixShown = false;
+  for (const id in state.markers) map.removeLayer(state.markers[id]);
+  for (const id in state.trails) map.removeLayer(state.trails[id]);
+  state.markers = {}; state.trails = {};
   const root = `${TOPIC_PREFIX}/${key}`;
-  setConn('var(--warn)', 'Connecting to broker…');
+  setConn('connecting'); renderAll();
   client = mqtt.connect(BROKER_URL, {
     clientId: 'web-' + Math.random().toString(16).slice(2, 10),
     clean: true, reconnectPeriod: 3000, connectTimeout: 15000,
   });
   client.on('connect', () => {
-    setConn('var(--ok)', 'Connected (live)');
+    state.connected = true; state.connectedAt = Date.now();
+    setConn('live'); renderAll();
     client.subscribe([`${root}/+/loc`, `${root}/+/status`], { qos: 0 });
   });
-  client.on('reconnect', () => setConn('var(--warn)', 'Reconnecting…'));
-  client.on('offline', () => setConn('var(--bad)', 'Offline – check internet'));
-  client.on('error', (e) => setConn('var(--bad)', 'Error: ' + e.message));
+  client.on('reconnect', () => setConn('reconnecting'));
+  client.on('offline', () => { state.connected = false; setConn('offlineNet'); });
+  client.on('close', () => { state.connected = false; });
+  client.on('error', () => setConn('error'));
   client.on('message', (topic, payload, packet) => {
     const parts = topic.split('/');                 // gpstrk / key / device / kind
-    if (parts.length !== 4) return;
+    if (parts.length !== 4 || parts[1] !== key) return;
     const id = parts[2].slice(0, 32), kind = parts[3], text = payload.toString();
-    if (kind === 'status') return onStatus(id, text.trim());
+    if (kind === 'status') return onStatus(id, text.trim(), packet.retain);
     if (kind === 'loc') {
       let msg; try { msg = JSON.parse(text); } catch (e) { return; }
       if (msg && typeof msg === 'object') onLocation(id, msg, packet.retain);
@@ -336,30 +1030,127 @@ function connect(key) {
   });
 }
 
+function cleanKey(k) { return (k || '').trim(); }
+function validKey(k) { return /^[^\s+#/]{1,64}$/.test(k); }        // MQTT topic level: no spaces, +, # or /
 function startWithKey(key) {
-  key = (key || '').trim().replace(/[#+/\s]/g, '');   // MQTT wildcard / separator chars are not allowed
-  if (!key) return;
+  key = cleanKey(key);
+  if (!validKey(key)) return false;
   store.set('trackerKey', key);
-  $('keyInput').value = key;
-  $('shareHint').textContent = location.href.split('#')[0] + '#key=' + key;
-  history.replaceState(null, '', '#key=' + encodeURIComponent(key));
+  history.replaceState(null, '', location.pathname + location.search + '#key=' + encodeURIComponent(key));
   connect(key);
+  return true;
 }
 
-$('keyBtn').onclick = () => startWithKey($('keyInput').value);
-$('keyInput').onkeydown = (e) => { if (e.key === 'Enter') startWithKey($('keyInput').value); };
+// =============================================================================
+// Modals
+// =============================================================================
+function openKeyModal(canCancel) {
+  $('keyInput').value = state.key || '';
+  $('keyErr').hidden = true;
+  $('keyCancelRow').hidden = !canCancel;
+  $('keyModal').hidden = false;
+  setTimeout(() => $('keyInput').focus(), 50);
+}
+function submitKey() {
+  const k = cleanKey($('keyInput').value);
+  if (!validKey(k)) { $('keyErr').textContent = t('keyBad'); $('keyErr').hidden = false; return; }
+  startWithKey(k); $('keyModal').hidden = true;
+}
+let qr = null;
+function shareUrl() { return location.origin + location.pathname + '#key=' + encodeURIComponent(state.key || ''); }
+function openShare() {
+  const url = shareUrl();
+  $('shareUrl').value = url;
+  $('waBtn').href = 'https://wa.me/?text=' + encodeURIComponent(t('shareText') + ' ' + url);
+  const box = $('qrBox'); box.textContent = '';
+  if (typeof QRCode !== 'undefined') {
+    try { qr = new QRCode(box, { text: url, width: 180, height: 180, correctLevel: QRCode.CorrectLevel.M }); } catch (e) { box.parentElement.hidden = true; }
+  } else box.parentElement.hidden = true;
+  $('shareModal').hidden = false;
+}
+
+// =============================================================================
+// UI wiring
+// =============================================================================
+$('langBtn').onclick = () => { settings.lang = settings.lang === 'bn' ? 'en' : 'bn'; saveSettings(); applyLanguage(); geo.lastMs = 0; geo.lastLL = null; maybeGeocode(state.devices[state.selected]); };
+$('themeBtn').onclick = () => { settings.theme = { auto: 'light', light: 'dark', dark: 'auto' }[settings.theme]; saveSettings(); applyTheme(); };
+document.querySelectorAll('#styleSeg button').forEach((b) => { b.onclick = () => { settings.mapStyle = b.dataset.style; saveSettings(); applyMapStyle(); }; });
+$('followBtn').onclick = () => {
+  settings.follow = !settings.follow; saveSettings(); renderAll();
+  const d = state.devices[state.selected];
+  if (settings.follow && d && d.lat != null) map.panTo([d.lat, d.lng]);
+};
+$('fitBtn').onclick = () => {
+  const pts = Object.values(state.devices).filter((d) => d.lat != null).map((d) => [d.lat, d.lng]);
+  if (pts.length === 1) map.setView(pts[0], 16); else if (pts.length > 1) map.fitBounds(pts, { padding: [60, 60] });
+};
 $('clearTrail').onclick = () => {
   const id = state.selected; if (!id) return;
   if (state.trails[id]) state.trails[id].setLatLngs([]);
-  store.set(trailKey(id), []);
+  store.set(trailKey(id), []); toast(t('trailCleared'), 'ok', 2500);
 };
+$('fsBtn').onclick = () => {
+  if (!document.fullscreenElement) (document.documentElement.requestFullscreen || (() => {})).call(document.documentElement);
+  else document.exitFullscreen();
+};
+$('centerBtn').onclick = () => { const d = state.devices[state.selected]; if (d && d.lat != null) map.setView([d.lat, d.lng], Math.max(map.getZoom(), 16)); };
+$('shareBtn').onclick = openShare;
+$('shareClose').onclick = () => { $('shareModal').hidden = true; };
+$('copyLink').onclick = async () => { if (await copyText($('shareUrl').value)) { $('copyLink').textContent = t('copied'); setTimeout(() => { $('copyLink').textContent = t('copy'); }, 1500); } };
+$('copyPos').onclick = async () => { const d = state.devices[state.selected]; if (d && d.lat != null && await copyText(`${d.lat.toFixed(6)}, ${d.lng.toFixed(6)}`)) toast(t('copied'), 'ok', 2000); };
+$('resetTrip').onclick = () => { if (state.selected) { store.set(tripKey(state.selected), null); renderTrip(); } };
+$('keyBtnTop').onclick = () => openKeyModal(!!state.key);
+$('keyBtnFoot').onclick = () => openKeyModal(!!state.key);
+$('keyConnect').onclick = submitKey;
+$('keyInput').onkeydown = (e) => { if (e.key === 'Enter') submitKey(); };
+$('keyCancel').onclick = () => { $('keyModal').hidden = true; };
+[$('keyModal'), $('shareModal')].forEach((m) => m.addEventListener('click', (e) => {
+  if (e.target === m && (m.id === 'shareModal' || state.key)) m.hidden = true;
+}));
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { $('shareModal').hidden = true; if (state.key) $('keyModal').hidden = true; }
+});
+$('sheetHandle').onclick = () => { $('panel').classList.toggle('collapsed'); setTimeout(() => map.invalidateSize(), 300); };
 
-// Refresh "x s ago" / status colors every second
-setInterval(() => { for (const id in state.devices) updateMarker(id); renderDeviceList(); renderDetails(); }, 1000);
+// alert settings
+function bindSwitch(id, keyName) {
+  $(id).checked = settings[keyName];
+  $(id).onchange = () => {
+    settings[keyName] = $(id).checked; saveSettings(); updateNotifBar();
+  };
+}
+bindSwitch('speedOn', 'speedOn'); bindSwitch('offlineOn', 'offlineOn'); bindSwitch('battOn', 'battOn'); bindSwitch('soundOn', 'sound');
+function bindNumber(id, keyName, lo, hi) {
+  $(id).value = settings[keyName];
+  $(id).onchange = () => {
+    const v = Math.min(hi, Math.max(lo, Math.round(Number($(id).value) || settings[keyName])));
+    settings[keyName] = v; $(id).value = v; saveSettings();
+  };
+}
+bindNumber('speedLimit', 'speedLimit', 5, 200); bindNumber('offlineMin', 'offlineMin', 1, 120);
+$('notifBtn').onclick = () => { if ('Notification' in window) Notification.requestPermission().then(updateNotifBar); };
 
-// Key from the link (#key=...) or from the last visit
+// refresh "x s ago", status colours and offline checks every second
+setInterval(() => {
+  for (const id in state.devices) { updateMarker(id); checkAlerts(id); }
+  renderDeviceList(); renderDetails();
+}, 1000);
+
+// =============================================================================
+// Start
+// =============================================================================
+if (window.innerWidth <= 760) $('panel').classList.add('collapsed');
+applyMapStyle();
+applyTheme();
+applyLanguage();
+updateNotifBar();
 const fromHash = new URLSearchParams(location.hash.slice(1)).get('key');
-startWithKey(fromHash || store.get('trackerKey') || '');
+const initialKey = cleanKey(fromHash || store.get('trackerKey') || '');
+if (!startWithKey(initialKey)) openKeyModal(false);
+window.addEventListener('hashchange', () => {
+  const k = cleanKey(new URLSearchParams(location.hash.slice(1)).get('key'));
+  if (k && k !== state.key) startWithKey(k);
+});
 </script>
 </body>
 </html>
